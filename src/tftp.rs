@@ -196,6 +196,10 @@ fn parse_error(buf: &[u8]) -> TftpResult<Packet> {
 
 impl Packet {
     fn parse_from_buf(buf: &[u8]) -> TftpResult<Packet> {
+        if buf.len() < 4 {
+            return Err(SocketError::PacketParse("Packet too short!".to_string()));
+        }
+
         match retrieve_op_code(&buf[..2])? {
             OpCode::Rrq => parse_read_req(&buf),
             OpCode::Wrq => parse_write_req(&buf),
@@ -223,6 +227,7 @@ impl TftpSocket {
     pub async fn recv_with_timeout(&mut self, ttl: Duration) -> TftpResult<(Packet, SocketAddr)> {
         let mut buf = [0; 514];
         let (total_written, src) = timeout(ttl, self.sock.recv_from(&mut buf)).await??;
+
         let packet = Packet::parse_from_buf(&buf[..total_written])?;
         Ok((packet, src))
     }
@@ -301,6 +306,20 @@ mod tests {
         assert_eq!(packet.unwrap(), Packet::Error { code: ErrorCode::Illegal, message: "Illegal!".to_string() });
     }
 
+    #[test]
+    fn test_packet_parse_failures() {
+        // Invalid opcodes
+        assert!(!Packet::parse_from_buf(&vec![0x10]).is_ok());
+        assert!(!Packet::parse_from_buf(&vec![0x10, 0x00]).is_ok());
+        assert!(!Packet::parse_from_buf(&vec![0x00, 0x09]).is_ok());
+        // Invalid read path
+        assert!(!Packet::parse_from_buf(&vec![0x00, 0x01, 0x68, 0x69]).is_ok());
+        // Missing mode string
+        assert!(!Packet::parse_from_buf(&vec![0x00, 0x01, 0x68, 0x69, 0x00]).is_ok());
+        // Invalid mode string
+        assert!(!Packet::parse_from_buf(&vec![0x00, 0x01, 0x68, 0x69, 0x00, 0x62, 0x61, 0x64, 0x00 ]).is_ok());
+        
+    }
 
 }
 
