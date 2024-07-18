@@ -2,7 +2,7 @@ use async_io::Async;
 use std::error;
 use std::fmt;
 use std::io;
-use std::net::{UdpSocket, SocketAddr};
+use std::net::{Ipv4Addr, UdpSocket, SocketAddr};
 use std::time::Duration;
 use tokio::time::timeout;
 use tokio::time::error::Elapsed;
@@ -233,6 +233,12 @@ impl TftpSocket {
     }
 }
 
+impl From<Async<UdpSocket>> for TftpSocket {
+    fn from(s: Async<UdpSocket>) -> TftpSocket {
+        TftpSocket { sock: s }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,8 +324,20 @@ mod tests {
         assert!(!Packet::parse_from_buf(&vec![0x00, 0x01, 0x68, 0x69, 0x00]).is_ok());
         // Invalid mode string
         assert!(!Packet::parse_from_buf(&vec![0x00, 0x01, 0x68, 0x69, 0x00, 0x62, 0x61, 0x64, 0x00 ]).is_ok());
-        
     }
 
+    #[tokio::test]
+    async fn test_udp() {
+        let ip_addr = Ipv4Addr::new(127,0,0,1);
+        let addr: SocketAddr = (ip_addr, 12345).into();
+
+        let sock = Async::<UdpSocket>::bind(addr).unwrap();
+        let buf = vec![0x00, 0x04, 0x12, 0x34];
+        assert!(sock.send_to(&buf, addr).await.is_ok());
+
+        let mut rcv_sock = TftpSocket::from(sock);
+
+        assert_eq!(rcv_sock.recv_with_timeout(Duration::from_millis(1000)).await.unwrap(), (Packet::Ack{ block: 0x1234 }, addr));
+    }
 }
 
