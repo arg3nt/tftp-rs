@@ -131,7 +131,6 @@
 // - Max connections
 //
 
-use std::net::Ipv4Addr;
 
 pub mod processor;
 pub mod tftp;
@@ -139,6 +138,8 @@ pub mod srv_conn;
 
 use tftp::TftpSocket;
 use srv_conn::ServerRequestHandler;
+use std::net::Ipv4Addr;
+use std::path::PathBuf;
 
 use anyhow::Result;
 
@@ -153,7 +154,8 @@ async fn main() -> Result<()> {
         mode: tftp::FileMode::NetAscii,
     };
 
-    let handler = ServerRequestHandler::new(&packet, (Ipv4Addr::new(127, 0, 0, 1), 12345).into());
+    let path_prefix = PathBuf::from("/tmp/tftp");
+    let handler = ServerRequestHandler::new(&path_prefix, &packet, (Ipv4Addr::new(127, 0, 0, 1), 12345).into());
 
     Ok(())
 }

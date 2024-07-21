@@ -198,7 +198,7 @@ fn retrieve_op_code(buf: &[u8]) -> TftpResult<OpCode> {
 
 
 fn parse_path_and_mode(buf: &[u8]) -> TftpResult<(String, FileMode)> {
-    let (path, path_end) = string_from_buffer(&buf);
+    let (mut path, path_end) = string_from_buffer(&buf);
 
     if path_end == buf.len() {
         return Err(SocketError::PacketParse("Read request does not contain a mode, but it needs to!".to_string()));

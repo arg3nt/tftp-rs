@@ -26,6 +26,7 @@ use rand::Rng;
 use std::error;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
 use std::time::Duration;
 use tokio::io;
 use tokio::time::Instant;
@@ -64,6 +65,7 @@ async fn send_error_packet(
 
 impl ServerRequestHandler {
     pub async fn new(
+        path_prefix: &Path,
         initial_request: &tftp::Packet,
         src: SocketAddr,
     ) -> Result<ServerRequestHandler, ServerConnectionError> {
@@ -83,7 +85,8 @@ impl ServerRequestHandler {
                     ));
                 }
 
-                let processor = match PacketProcessor::new_for_reading(path).await {
+                let open_path = if path.starts_with("/") { &path[1..] } else { &path[..] };
+                let processor = match PacketProcessor::new_for_reading(&path_prefix.join(open_path)).await {
                     Ok(p) => p,
                     Err(e) => {
                         send_error_packet(&mut sock, src, e.kind().into(), format!("{:#?}", e)).await;
@@ -107,7 +110,8 @@ impl ServerRequestHandler {
                     ));
                 }
 
-                let processor = match PacketProcessor::new_for_writing(path).await {
+                let open_path = if path.starts_with("/") { &path[1..] } else { &path[..] };
+                let processor = match PacketProcessor::new_for_writing(&path_prefix.join(open_path)).await {
                     Ok(p) => p,
                     Err(e) => {
                         send_error_packet(&mut sock, src, e.kind().into(), format!("{:#?}", e)).await;

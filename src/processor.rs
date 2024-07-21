@@ -1,4 +1,5 @@
 use crate::tftp;
+use std::path::Path;
 use tokio::fs::File;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 
@@ -10,14 +11,14 @@ pub enum PacketProcessor {
 
 /// An entity that can process packets and produce a response.
 impl PacketProcessor {
-    pub async fn new_for_reading(path: &String) -> Result<PacketProcessor, io::Error> {
+    pub async fn new_for_reading(path: &Path) -> Result<PacketProcessor, io::Error> {
         match File::open(path).await {
             Ok(f) => Ok(PacketProcessor::Read(ReadProcessor::new(f))),
             Err(e) => Err(e),
         }
     }
 
-    pub async fn new_for_writing(path: &String) -> Result<PacketProcessor, io::Error> {
+    pub async fn new_for_writing(path: &Path) -> Result<PacketProcessor, io::Error> {
         match File::options()
             .read(true)
             .write(true)
@@ -258,7 +259,7 @@ mod tests {
     #[tokio::test]
     async fn test_new_for_reading_invalid_path() {
         assert_eq!(
-            PacketProcessor::new_for_reading(&"/some/invalid/path.txt".to_string())
+            PacketProcessor::new_for_reading(&Path::new("/some/invalid/file.txt"))
                 .await
                 .err()
                 .unwrap()
@@ -273,7 +274,7 @@ mod tests {
         let path = tmpdir.path().join("test.txt");
         let _ = File::create(path.clone()).await.unwrap();
 
-        let processor = PacketProcessor::new_for_reading(&path.to_str().unwrap().to_string()).await;
+        let processor = PacketProcessor::new_for_reading(&path).await;
         println!("{:#?}", processor);
         assert!(processor.is_ok());
     }
@@ -289,7 +290,7 @@ mod tests {
             contents.as_bytes().len()
         );
 
-        let mut processor = PacketProcessor::new_for_reading(&path.to_str().unwrap().to_string())
+        let mut processor = PacketProcessor::new_for_reading(&path)
             .await
             .inspect(|p| println!("{:#?}", p))
             .unwrap();
@@ -318,7 +319,7 @@ mod tests {
             contents.as_bytes().len()
         );
 
-        let mut processor = PacketProcessor::new_for_reading(&path.to_str().unwrap().to_string())
+        let mut processor = PacketProcessor::new_for_reading(&path)
             .await
             .inspect(|p| println!("{:#?}", p))
             .unwrap();
@@ -374,7 +375,7 @@ mod tests {
             contents.as_bytes().len()
         );
 
-        let mut processor = PacketProcessor::new_for_reading(&path.to_str().unwrap().to_string())
+        let mut processor = PacketProcessor::new_for_reading(&path)
             .await
             .inspect(|p| println!("{:#?}", p))
             .unwrap();
@@ -414,7 +415,7 @@ mod tests {
             contents.as_bytes().len()
         );
 
-        let mut processor = PacketProcessor::new_for_reading(&path.to_str().unwrap().to_string())
+        let mut processor = PacketProcessor::new_for_reading(&path)
             .await
             .inspect(|p| println!("{:#?}", p))
             .unwrap();
@@ -463,7 +464,7 @@ mod tests {
             contents.as_bytes().len()
         );
 
-        let mut processor = PacketProcessor::new_for_reading(&path.to_str().unwrap().to_string())
+        let mut processor = PacketProcessor::new_for_reading(&path)
             .await
             .inspect(|p| println!("{:#?}", p))
             .unwrap();
@@ -491,7 +492,7 @@ mod tests {
     #[tokio::test]
     async fn test_new_for_writing_invalid_path() {
         assert_eq!(
-            PacketProcessor::new_for_writing(&"/some/invalid/path.txt".to_string())
+            PacketProcessor::new_for_writing(&Path::new("/some/invalid/path.txt"))
                 .await
                 .err()
                 .unwrap()
@@ -505,7 +506,7 @@ mod tests {
         let tmpdir = TempDir::new("scratch").unwrap();
         let path = tmpdir.path().join("test.txt");
 
-        let processor = PacketProcessor::new_for_writing(&path.to_str().unwrap().to_string()).await;
+        let processor = PacketProcessor::new_for_writing(&path).await;
         println!("{:#?}", processor);
         assert!(processor.is_ok());
     }
@@ -515,7 +516,7 @@ mod tests {
         let tmpdir = TempDir::new("scratch").unwrap();
         let path = tmpdir.path().join("test.txt");
 
-        let mut processor = PacketProcessor::new_for_writing(&path.to_str().unwrap().to_string())
+        let mut processor = PacketProcessor::new_for_writing(&path)
             .await
             .inspect(|p| println!("{:#?}", p))
             .unwrap();
@@ -531,7 +532,7 @@ mod tests {
         let tmpdir = TempDir::new("scratch").unwrap();
         let path = tmpdir.path().join("test.txt");
 
-        let mut processor = PacketProcessor::new_for_writing(&path.to_str().unwrap().to_string())
+        let mut processor = PacketProcessor::new_for_writing(&path)
             .await
             .inspect(|p| println!("{:#?}", p))
             .unwrap();
@@ -567,7 +568,7 @@ mod tests {
         let tmpdir = TempDir::new("scratch").unwrap();
         let path = tmpdir.path().join("test.txt");
 
-        let mut processor = PacketProcessor::new_for_writing(&path.to_str().unwrap().to_string())
+        let mut processor = PacketProcessor::new_for_writing(&path)
             .await
             .inspect(|p| println!("{:#?}", p))
             .unwrap();
@@ -591,7 +592,7 @@ mod tests {
         let tmpdir = TempDir::new("scratch").unwrap();
         let path = tmpdir.path().join("test.txt");
 
-        let mut processor = PacketProcessor::new_for_writing(&path.to_str().unwrap().to_string())
+        let mut processor = PacketProcessor::new_for_writing(&path)
             .await
             .inspect(|p| println!("{:#?}", p))
             .unwrap();
@@ -620,7 +621,7 @@ mod tests {
         let tmpdir = TempDir::new("scratch").unwrap();
         let path = tmpdir.path().join("test.txt");
 
-        let mut processor = PacketProcessor::new_for_writing(&path.to_str().unwrap().to_string())
+        let mut processor = PacketProcessor::new_for_writing(&path)
             .await
             .inspect(|p| println!("{:#?}", p))
             .unwrap();
