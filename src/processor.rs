@@ -11,18 +11,18 @@ pub enum PacketProcessor {
 
 /// An entity that can process packets and produce a response.
 impl PacketProcessor {
-    pub async fn new_for_reading(path: &Path) -> Result<PacketProcessor, io::Error> {
+    pub async fn new_for_reading(path: &Path, opt: tftp::ReqOptions) -> Result<PacketProcessor, io::Error> {
         match File::open(path).await {
-            Ok(f) => Ok(PacketProcessor::Read(ReadProcessor::new(f))),
+            Ok(f) => Ok(PacketProcessor::Read(ReadProcessor::new(f, opt))),
             Err(e) => Err(e),
         }
     }
 
-    pub async fn new_for_writing(path: &Path) -> Result<PacketProcessor, io::Error> {
+    pub async fn new_for_writing(path: &Path, opt: tftp::ReqOptions) -> Result<PacketProcessor, io::Error> {
         log::info!("Writing to {:#?}", path);
         match File::create_new(path).await
         {
-            Ok(f) => Ok(PacketProcessor::Write(WriteProcessor::new(f))),
+            Ok(f) => Ok(PacketProcessor::Write(WriteProcessor::new(f, opt))),
             Err(e) => Err(e),
         }
     }
@@ -69,14 +69,25 @@ pub struct ReadProcessor {
     f: File,
     curr_block: u16,
     awaiting_final_ack: bool,
+    sent_oack: bool,
+    opt: tftp::ReqOptions,
 }
 
 impl ReadProcessor {
-    fn new(f: File) -> ReadProcessor {
+    fn new(f: File, opt: tftp::ReqOptions) -> ReadProcessor {
         ReadProcessor {
             f,
             curr_block: 0,
             awaiting_final_ack: false,
+            sent_oack: false,
+            opt
+        }
+    }
+
+    fn get_block_size(&self) -> usize {
+        match self.opt.block_size {
+            Some(s) => s.into(),
+            None => 512,
         }
     }
 
@@ -88,10 +99,18 @@ impl ReadProcessor {
                         if self.awaiting_final_ack {
                             return ResultAction::CloseConnection(None)
                         }
-                        match read_block_from_file(&mut self.f).await {
+                        if self.curr_block == 0 && !self.sent_oack && self.opt != tftp::ReqOptions::none() {
+                            self.sent_oack = true;
+                            return ResultAction::SendPacketAndAwait(
+                                tftp::Packet::OptionsAck(self.opt)
+                            );
+                        }
+
+                        let block_size = self.get_block_size();
+                        match read_block_from_file(&mut self.f, block_size).await {
                             Ok(data) => {
                                 self.curr_block += 1;
-                                if data.len() < tftp::DATA_BUFFER_SIZE {
+                                if data.len() < block_size {
                                     self.awaiting_final_ack = true;
                                 }
                                 ResultAction::SendPacketAndAwait(
@@ -135,8 +154,8 @@ impl ReadProcessor {
     }
 }
 
-async fn read_block_from_file(f: &mut File) -> Result<Vec<u8>, io::Error> {
-    let mut buf = vec![0_u8; tftp::DATA_BUFFER_SIZE];
+async fn read_block_from_file(f: &mut File, block_size: usize) -> Result<Vec<u8>, io::Error> {
+    let mut buf = vec![0_u8; block_size];
     let mut cursor = 0;
 
     // Reading works this way because we have no guarantee that a particular call to read will
@@ -165,11 +184,19 @@ async fn read_block_from_file(f: &mut File) -> Result<Vec<u8>, io::Error> {
 pub struct WriteProcessor {
     f: File,
     curr_block: u16,
+    opt: tftp::ReqOptions,
 }
 
 impl WriteProcessor {
-    fn new(f: File) -> WriteProcessor {
-        WriteProcessor { f, curr_block: 0 }
+    fn new(f: File, opt: tftp::ReqOptions) -> WriteProcessor {
+        WriteProcessor { f, curr_block: 0, opt }
+    }
+
+    fn get_block_size(&self) -> usize {
+        match self.opt.block_size {
+            Some(s) => s.into(),
+            None => 510,
+        }
     }
 
     async fn process_data(&mut self, packet: &tftp::Packet) -> ResultAction {
@@ -177,9 +204,12 @@ impl WriteProcessor {
             tftp::Packet::Data { block, data } => {
                 match block {
                     block if *block == 0 && self.curr_block == 0 => {
-                        ResultAction::SendPacketAndAwait(
-                            tftp::Packet::Ack { block: 0 }
-                        )
+                        let packet = if self.opt == tftp::ReqOptions::none() {
+                                tftp::Packet::Ack { block: 0 }
+                        } else {
+                            tftp::Packet::OptionsAck(self.opt)
+                        };
+                        ResultAction::SendPacketAndAwait(packet)
                     },
                     block if *block == self.curr_block + 1 => {
                         match write_block_to_file(&mut self.f, &data).await {
@@ -187,7 +217,7 @@ impl WriteProcessor {
                                 self.curr_block += 1;
                                 let packet = tftp::Packet::Ack { block: self.curr_block };
 
-                                if data.len() < tftp::DATA_BUFFER_SIZE {
+                                if data.len() < self.get_block_size() {
                                     ResultAction::TerminateWithPacket(packet)
                                 } else {
                                     ResultAction::SendPacketAndAwait(packet)
@@ -255,7 +285,7 @@ mod tests {
     #[tokio::test]
     async fn test_new_for_reading_invalid_path() {
         assert_eq!(
-            PacketProcessor::new_for_reading(&Path::new("/some/invalid/file.txt"))
+            PacketProcessor::new_for_reading(&Path::new("/some/invalid/file.txt"), tftp::ReqOptions::none())
                 .await
                 .err()
                 .unwrap()
@@ -270,7 +300,7 @@ mod tests {
         let path = tmpdir.path().join("test.txt");
         let _ = File::create(path.clone()).await.unwrap();
 
-        let processor = PacketProcessor::new_for_reading(&path).await;
+        let processor = PacketProcessor::new_for_reading(&path, tftp::ReqOptions::none()).await;
         println!("{:#?}", processor);
         assert!(processor.is_ok());
     }
@@ -286,7 +316,7 @@ mod tests {
             contents.as_bytes().len()
         );
 
-        let mut processor = PacketProcessor::new_for_reading(&path)
+        let mut processor = PacketProcessor::new_for_reading(&path, tftp::ReqOptions::none())
             .await
             .inspect(|p| println!("{:#?}", p))
             .unwrap();
@@ -300,13 +330,21 @@ mod tests {
         );
     }
 
+    fn set_block_size(block_size: u16) -> tftp::ReqOptions {
+        tftp::ReqOptions {
+            block_size: Some(block_size),
+            timeout: None,
+            tsize: None,
+        }
+    }
+
     #[tokio::test]
     async fn test_read_multiple_packets_succeeds() {
         let tmpdir = TempDir::new("scratch").unwrap();
         let path = tmpdir.path().join("test.txt");
         let mut file = File::create(path.clone()).await.unwrap();
         let mut contents = String::new();
-        for _ in 0..1024 {
+        for _ in 0..1000 {
             contents.push('x');
         }
         contents.push_str("testing");
@@ -315,16 +353,21 @@ mod tests {
             contents.as_bytes().len()
         );
 
-        let mut processor = PacketProcessor::new_for_reading(&path)
+        let mut processor = PacketProcessor::new_for_reading(&path, set_block_size(500))
             .await
             .inspect(|p| println!("{:#?}", p))
             .unwrap();
 
         assert_eq!(
             processor.first_packet().await,
+            ResultAction::SendPacketAndAwait(tftp::Packet::OptionsAck(set_block_size(500)))
+        );
+
+        assert_eq!(
+            processor.process_packet(&tftp::Packet::Ack { block: 0}).await,
             ResultAction::SendPacketAndAwait(tftp::Packet::Data {
                 block: 1,
-                data: vec![0x78; 512]
+                data: vec![0x78; 500]
             })
         );
 
@@ -334,7 +377,7 @@ mod tests {
                 .await,
             ResultAction::SendPacketAndAwait(tftp::Packet::Data {
                 block: 2,
-                data: vec![0x78; 512]
+                data: vec![0x78; 500]
             })
         );
 
@@ -362,7 +405,7 @@ mod tests {
         let path = tmpdir.path().join("test.txt");
         let mut file = File::create(path.clone()).await.unwrap();
         let mut contents = String::new();
-        for _ in 0..1024 {
+        for _ in 0..8 {
             contents.push('x');
         }
         contents.push_str("testing");
@@ -371,17 +414,14 @@ mod tests {
             contents.as_bytes().len()
         );
 
-        let mut processor = PacketProcessor::new_for_reading(&path)
+        let mut processor = PacketProcessor::new_for_reading(&path, set_block_size(8))
             .await
             .inspect(|p| println!("{:#?}", p))
             .unwrap();
 
         assert_eq!(
             processor.first_packet().await,
-            ResultAction::SendPacketAndAwait(tftp::Packet::Data {
-                block: 1,
-                data: vec![0x78; 512]
-            })
+            ResultAction::SendPacketAndAwait(tftp::Packet::OptionsAck(set_block_size(8)))
         );
 
         assert_eq!(
@@ -402,7 +442,7 @@ mod tests {
         let path = tmpdir.path().join("test.txt");
         let mut file = File::create(path.clone()).await.unwrap();
         let mut contents = String::new();
-        for _ in 0..1024 {
+        for _ in 0..8 {
             contents.push('x');
         }
         contents.push_str("testing");
@@ -411,17 +451,14 @@ mod tests {
             contents.as_bytes().len()
         );
 
-        let mut processor = PacketProcessor::new_for_reading(&path)
+        let mut processor = PacketProcessor::new_for_reading(&path, set_block_size(8))
             .await
             .inspect(|p| println!("{:#?}", p))
             .unwrap();
 
         assert_eq!(
             processor.first_packet().await,
-            ResultAction::SendPacketAndAwait(tftp::Packet::Data {
-                block: 1,
-                data: vec![0x78; 512]
-            })
+            ResultAction::SendPacketAndAwait(tftp::Packet::OptionsAck(set_block_size(8)))
         );
 
         assert_eq!(
@@ -451,7 +488,7 @@ mod tests {
         let path = tmpdir.path().join("test.txt");
         let mut file = File::create(path.clone()).await.unwrap();
         let mut contents = String::new();
-        for _ in 0..1024 {
+        for _ in 0..8 {
             contents.push('x');
         }
         contents.push_str("testing");
@@ -460,17 +497,14 @@ mod tests {
             contents.as_bytes().len()
         );
 
-        let mut processor = PacketProcessor::new_for_reading(&path)
+        let mut processor = PacketProcessor::new_for_reading(&path, set_block_size(8))
             .await
             .inspect(|p| println!("{:#?}", p))
             .unwrap();
 
         assert_eq!(
             processor.first_packet().await,
-            ResultAction::SendPacketAndAwait(tftp::Packet::Data {
-                block: 1,
-                data: vec![0x78; 512]
-            })
+            ResultAction::SendPacketAndAwait(tftp::Packet::OptionsAck(set_block_size(8)))
         );
 
         assert_eq!(
@@ -479,7 +513,7 @@ mod tests {
                 .await,
             ResultAction::TerminateWithPacket(tftp::Packet::Error {
                 code: tftp::ErrorCode::Illegal,
-                message: "Cannot acknowledge a block which was not yet sent. Server's current block is 1, but received an ack for 2".to_string(),
+                message: "Cannot acknowledge a block which was not yet sent. Server's current block is 0, but received an ack for 2".to_string(),
             })
         );
     }
@@ -488,7 +522,7 @@ mod tests {
     #[tokio::test]
     async fn test_new_for_writing_invalid_path() {
         assert_eq!(
-            PacketProcessor::new_for_writing(&Path::new("/some/invalid/path.txt"))
+            PacketProcessor::new_for_writing(&Path::new("/some/invalid/path.txt"), tftp::ReqOptions::none())
                 .await
                 .err()
                 .unwrap()
@@ -502,7 +536,7 @@ mod tests {
         let tmpdir = TempDir::new("scratch").unwrap();
         let path = tmpdir.path().join("test.txt");
 
-        let processor = PacketProcessor::new_for_writing(&path).await;
+        let processor = PacketProcessor::new_for_writing(&path, tftp::ReqOptions::none()).await;
         println!("{:#?}", processor);
         assert!(processor.is_ok());
     }
@@ -512,7 +546,7 @@ mod tests {
         let tmpdir = TempDir::new("scratch").unwrap();
         let path = tmpdir.path().join("test.txt");
 
-        let mut processor = PacketProcessor::new_for_writing(&path)
+        let mut processor = PacketProcessor::new_for_writing(&path, tftp::ReqOptions::none())
             .await
             .inspect(|p| println!("{:#?}", p))
             .unwrap();
@@ -528,21 +562,21 @@ mod tests {
         let tmpdir = TempDir::new("scratch").unwrap();
         let path = tmpdir.path().join("test.txt");
 
-        let mut processor = PacketProcessor::new_for_writing(&path)
+        let mut processor = PacketProcessor::new_for_writing(&path, set_block_size(8))
             .await
             .inspect(|p| println!("{:#?}", p))
             .unwrap();
 
         assert_eq!(
             processor.first_packet().await,
-            ResultAction::SendPacketAndAwait(tftp::Packet::Ack { block: 0 })
+            ResultAction::SendPacketAndAwait(tftp::Packet::OptionsAck(set_block_size(8)))
         );
 
         assert_eq!(
             processor
                 .process_packet(&tftp::Packet::Data {
                     block: 1,
-                    data: vec![0x78; 512],
+                    data: vec![0x78; 8],
                 })
                 .await,
             ResultAction::SendPacketAndAwait(tftp::Packet::Ack { block: 1 })
@@ -557,6 +591,13 @@ mod tests {
                 .await,
             ResultAction::TerminateWithPacket(tftp::Packet::Ack { block: 2 })
         );
+
+        let mut actual_contents = String::new();
+        assert!(File::open(path).await.unwrap().read_to_string(&mut actual_contents).await.is_ok());
+        assert_eq!(
+            actual_contents,
+            "xxxxxxxxtesting".to_string(),
+        );
     }
 
     #[tokio::test]
@@ -564,7 +605,7 @@ mod tests {
         let tmpdir = TempDir::new("scratch").unwrap();
         let path = tmpdir.path().join("test.txt");
 
-        let mut processor = PacketProcessor::new_for_writing(&path)
+        let mut processor = PacketProcessor::new_for_writing(&path, tftp::ReqOptions::none())
             .await
             .inspect(|p| println!("{:#?}", p))
             .unwrap();
@@ -588,7 +629,7 @@ mod tests {
         let tmpdir = TempDir::new("scratch").unwrap();
         let path = tmpdir.path().join("test.txt");
 
-        let mut processor = PacketProcessor::new_for_writing(&path)
+        let mut processor = PacketProcessor::new_for_writing(&path, tftp::ReqOptions::none())
             .await
             .inspect(|p| println!("{:#?}", p))
             .unwrap();
@@ -617,7 +658,7 @@ mod tests {
         let tmpdir = TempDir::new("scratch").unwrap();
         let path = tmpdir.path().join("test.txt");
 
-        let mut processor = PacketProcessor::new_for_writing(&path)
+        let mut processor = PacketProcessor::new_for_writing(&path, tftp::ReqOptions::none())
             .await
             .inspect(|p| println!("{:#?}", p))
             .unwrap();

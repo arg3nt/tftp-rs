@@ -73,8 +73,8 @@ impl ServerRequestHandler {
         log::info!("Binding socket");
         let mut sock = bind_random_socket();
         match initial_request {
-            tftp::Packet::ReadReq { path, mode } => {
-                if *mode == tftp::FileMode::Mail {
+            tftp::Packet::ReadReq(data) => {
+                if data.mode == tftp::FileMode::Mail {
                     send_error_packet(
                         &mut sock,
                         src,
@@ -87,8 +87,8 @@ impl ServerRequestHandler {
                     ));
                 }
 
-                let open_path = if path.starts_with("/") { &path[1..] } else { &path[..] };
-                let processor = match PacketProcessor::new_for_reading(&path_prefix.join(open_path)).await {
+                let open_path = if data.path.starts_with("/") { &data.path[1..] } else { &data.path[..] };
+                let processor = match PacketProcessor::new_for_reading(&path_prefix.join(open_path), data.opt).await {
                     Ok(p) => p,
                     Err(e) => {
                         send_error_packet(&mut sock, src, e.kind().into(), format!("{:#?}", e)).await;
@@ -98,8 +98,8 @@ impl ServerRequestHandler {
 
                 Ok(ServerRequestHandler { sock, dst: src, processor})
             },
-            tftp::Packet::WriteReq { path, mode } => {
-                if *mode == tftp::FileMode::Mail {
+            tftp::Packet::WriteReq(data) => {
+                if data.mode == tftp::FileMode::Mail {
                     send_error_packet(
                         &mut sock,
                         src,
@@ -112,8 +112,8 @@ impl ServerRequestHandler {
                     ));
                 }
 
-                let open_path = if path.starts_with("/") { &path[1..] } else { &path[..] };
-                let processor = match PacketProcessor::new_for_writing(&path_prefix.join(open_path)).await {
+                let open_path = if data.path.starts_with("/") { &data.path[1..] } else { &data.path[..] };
+                let processor = match PacketProcessor::new_for_writing(&path_prefix.join(open_path), data.opt).await {
                     Ok(p) => p,
                     Err(e) => {
                         send_error_packet(&mut sock, src, e.kind().into(), format!("{:#?}", e)).await;
@@ -153,13 +153,13 @@ impl ServerRequestHandler {
 
         // This loop is used for message sending as well as retries, depending on whether
         // |out_packet| has been overwritten.
+        let mut started_waiting = Instant::now();
         loop {
             if let Err(e) = self.sock.send(&out_packet, self.dst).await {
                 log::warn!("Unable to send packet: {e}");
                 return;
             }
 
-            let started_waiting = Instant::now();
             while started_waiting.elapsed() < connection_timeout {
                 match self
                     .sock
@@ -186,6 +186,7 @@ impl ServerRequestHandler {
                         match self.processor.process_packet(&packet).await {
                             ResultAction::SendPacketAndAwait(p) => {
                                 out_packet = p;
+                                started_waiting = Instant::now();
                                 break;
                             }
                             ResultAction::CloseConnection(maybe_warn) => {
@@ -236,6 +237,11 @@ impl ServerRequestHandler {
                         return;
                     }
                 }
+            }
+
+            if started_waiting.elapsed() >= connection_timeout {
+                log::info!("Deadline exceeded, closing connection");
+                return;
             }
         }
     }

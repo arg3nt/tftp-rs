@@ -7,7 +7,8 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tokio::time::error::Elapsed;
 
-pub const DATA_BUFFER_SIZE: usize = 512;
+pub const READ_DATA_BUFFER_SIZE: usize = 512;
+pub const WRITE_DATA_BUFFER_SIZE: usize = READ_DATA_BUFFER_SIZE - 2;
 
 ///////////////////////////////////////////////////////////////
 // Error-handling objects
@@ -117,23 +118,126 @@ impl From<io::ErrorKind> for ErrorCode {
     }
 }
 
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReqOptions {
+    /// How many bytes should be transferred in each block. Must be between 8 and 65,464.
+    pub block_size: Option<u16>,
+
+    /// How many seconds to wait before retransmitting. Must be between 1 and 255.
+    pub timeout: Option<u8>,
+
+    /// How many bytes the total transfer size will be.
+    pub tsize: Option<usize>,
+}
+
+impl ReqOptions {
+    pub fn none() -> ReqOptions {
+        ReqOptions {
+            block_size: None,
+            timeout: None,
+            tsize: None,
+        }
+    }
+
+    fn parse_from_buf(buf: &[u8]) -> ReqOptions {
+        println!("Parsing from buffer: {}", String::from_utf8(buf.into()).unwrap());
+        let mut cursor = 0;
+        let mut opt = ReqOptions::none();
+
+        loop {
+            let (key, key_size) = string_from_buffer(&buf[cursor..]);
+            if key_size == 0 || cursor + key_size >= buf.len() { return opt; }
+
+            cursor += key_size + 1;
+            let (raw_val, val_size) = string_from_buffer(&buf[cursor..]);
+            if val_size == 0 || cursor + val_size >= buf.len() { return opt; }
+            cursor += val_size + 1;
+
+            match key.as_str() {
+                "blksize" => {
+                    if let Ok(val) = raw_val.parse::<u16>() {
+                        opt.block_size = Some(val);
+                    }
+                },
+                // "timeout" => {
+                //     if let Ok(val) = raw_val.parse::<u8>() {
+                //         opt.timeout = Some(val);
+                //     }
+                // },
+                // "tsize" => {
+                //     if let Ok(val) = raw_val.parse::<usize>() {
+                //         opt.tsize = Some(val);
+                //     }
+                // },
+                _ => { continue; },
+            }
+
+        }
+    }
+
+    fn add_options(&self, buf: &mut Vec<u8>) {
+        if let Some(block_size) = self.block_size {
+            buf.extend("blksize".to_string().as_bytes());
+            buf.push(0x00);
+            buf.extend(block_size.to_string().as_bytes());
+            buf.push(0x00);
+        }
+
+        if let Some(timeout) = self.timeout {
+            buf.extend("timeout".to_string().as_bytes());
+            buf.push(0x00);
+            buf.extend(timeout.to_string().as_bytes());
+            buf.push(0x00);
+        }
+
+        if let Some(tsize) = self.tsize {
+            buf.extend("tsize".to_string().as_bytes());
+            buf.push(0x00);
+            buf.extend(tsize.to_string().as_bytes());
+            buf.push(0x00);
+        }
+    }
+}
+
+impl fmt::Display for ReqOptions {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if let Some(bs) = self.block_size {
+            write!(f, "block_size: {} ", bs)?;
+        }
+        if let Some(to) = self.timeout {
+            write!(f, "timeout: {}", to)?;
+        }
+        if let Some(ts) = self.tsize {
+            write!(f, "tsize: {} ", ts)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InitData {
+    /////////////
+    // Mandatory
+
+    /// The path of the file being worked with.
+    pub path: String,
+
+    /// The file mode.
+    pub mode: FileMode,
+
+    /// Options accompanying the request.
+    pub opt: ReqOptions,
+}
+
 /// An enum representing a TFTP packet and its associated data.
 #[derive(Debug, PartialEq)]
 pub enum Packet {
     /// A read request packet
-    ReadReq {
-        /// The file path the client wants to read.
-        path: String,
-
-        /// The file mode.
-        mode: FileMode,
-    },
+    ReadReq(InitData),
 
     /// A write request packet
-    WriteReq {
-        path: String,
-        mode: FileMode,
-    },
+    WriteReq(InitData),
 
     /// A data packet
     Data {
@@ -152,19 +256,32 @@ pub enum Packet {
 
     /// An error packet.
     Error {
+        /// The error code.
         code: ErrorCode,
+
+        /// A human-readable message associated with the error.
         message: String,
     },
+
+    /// An acknowledgement of options packet.
+    OptionsAck(ReqOptions),
 }
 
 impl fmt::Display for Packet {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::ReadReq { path, mode } => write!(f, "ReadReq < path: '{}', mode: '{:#?}' >", path, mode),
-            Self::WriteReq { path, mode } => write!(f, "WriteReq < path: '{}', mode: '{:#?}' >", path, mode),
+            Self::ReadReq(d) => write!(
+                f, "ReadReq < path: '{}', mode: '{:#?}', {} >",
+                d.path, d.mode, d.opt
+            ),
+            Self::WriteReq(d) => write!(
+                f, "WriteReq < path: '{}', mode: '{:#?}', {} >",
+                d.path, d.mode, d.opt
+            ),
             Self::Data { block, data } => write!(f, "Data < block: {block}, data_len: {len} >", len = data.len()),
             Self::Ack { block } => write!(f, "Ack < block: {block} >"),
             Self::Error { code, message } => write!(f, "Error < code: {:#?}, message: {message} >", code),
+            Self::OptionsAck(opt) => write!(f, "OptionsAck < {} >", opt),
         }
     }
 }
@@ -193,7 +310,7 @@ fn string_from_buffer(buf: &[u8]) -> (String, usize) {
 
 /// Utility function for obtaining the TFTP OpCode from a buffer
 #[derive(Debug, PartialEq)]
-pub enum OpCode { Rrq, Wrq, Data, Ack, Error }
+pub enum OpCode { Rrq, Wrq, Data, Ack, Error, OAck }
 
 fn retrieve_op_code(buf: &[u8]) -> TftpResult<OpCode> {
     let rawcode = u16_from_buffer(&buf[..2]);
@@ -203,24 +320,32 @@ fn retrieve_op_code(buf: &[u8]) -> TftpResult<OpCode> {
         3 => Ok(OpCode::Data),
         4 => Ok(OpCode::Ack),
         5 => Ok(OpCode::Error),
+        6 => Ok(OpCode::OAck),
         _ => return Err(SocketError::PacketParse(
             format!("Uknown opcode retrieved: {rawcode}").to_string())),
     }
 }
 
+fn parse_init_data(buf: &[u8]) -> TftpResult<InitData> {
+    let mut cursor = 0;
+    let (path, path_size) = string_from_buffer(&buf);
+    cursor += path_size;
 
-fn parse_path_and_mode(buf: &[u8]) -> TftpResult<(String, FileMode)> {
-    let (path, path_end) = string_from_buffer(&buf);
-
-    if path_end == buf.len() {
+    if cursor == buf.len() {
         return Err(SocketError::PacketParse("Read request does not contain a mode, but it needs to!".to_string()));
     }
 
-    let (raw_mode, mode_end) = string_from_buffer(&buf[path_end+1..]);
+    // Each string is terminated with a null byte.
+    cursor += 1;
 
-    if path_end + mode_end >= buf.len() {
+    let (raw_mode, mode_size) = string_from_buffer(&buf[cursor..]);
+    cursor += mode_size;
+
+    if cursor >= buf.len() {
         return Err(SocketError::PacketParse("Mode must be terminated with a null byte!".to_string()));
     }
+
+    cursor += 1;
 
     let mode = match raw_mode.to_lowercase().as_str() {
         "netascii" => FileMode::NetAscii,
@@ -229,17 +354,15 @@ fn parse_path_and_mode(buf: &[u8]) -> TftpResult<(String, FileMode)> {
         _ => return Err(SocketError::PacketParse(format!("Unknown file mode: '{raw_mode}'")))
     };
 
-    Ok((path, mode))
+    Ok(InitData { path, mode, opt: ReqOptions::parse_from_buf(&buf[cursor..]) })
 }
 
 fn parse_read_req(buf: &[u8]) -> TftpResult<Packet> {
-    let (path, mode) = parse_path_and_mode(&buf[2..])?;
-    Ok(Packet::ReadReq { path, mode })
+    Ok(Packet::ReadReq(parse_init_data(&buf[2..])?))
 }
 
 fn parse_write_req(buf: &[u8]) -> TftpResult<Packet> {
-    let (path, mode) = parse_path_and_mode(&buf[2..])?;
-    Ok(Packet::WriteReq { path, mode })
+    Ok(Packet::WriteReq(parse_init_data(&buf[2..])?))
 }
 
 fn parse_data(buf: &[u8]) -> TftpResult<Packet> {
@@ -259,6 +382,10 @@ fn parse_error(buf: &[u8]) -> TftpResult<Packet> {
     Ok(Packet::Error { code: raw_err.into(), message })
 }
 
+fn parse_oack(buf: &[u8]) -> TftpResult<Packet> {
+    Ok(Packet::OptionsAck(ReqOptions::parse_from_buf(&buf[2..])))
+}
+
 impl Packet {
     fn parse_from_buf(buf: &[u8]) -> TftpResult<Packet> {
         if buf.len() < 4 {
@@ -271,25 +398,28 @@ impl Packet {
             OpCode::Data => parse_data(&buf),
             OpCode::Ack => parse_ack(&buf),
             OpCode::Error => parse_error(&buf),
+            OpCode::OAck => parse_oack(&buf),
         }
     }
 
     fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         match self {
-            Self::ReadReq { path, mode } => {
+            Self::ReadReq(data) => {
                 buf.extend(0x0001_u16.to_be_bytes());
-                buf.extend(path.as_bytes());
+                buf.extend(data.path.as_bytes());
                 buf.push(0x00);
-                buf.extend(mode.to_string().as_bytes());
+                buf.extend(data.mode.to_string().as_bytes());
                 buf.push(0x00);
+                data.opt.add_options(&mut buf);
             },
-            Self::WriteReq { path, mode } => {
+            Self::WriteReq(data) => {
                 buf.extend(0x0002_u16.to_be_bytes());
-                buf.extend(path.as_bytes());
+                buf.extend(data.path.as_bytes());
                 buf.push(0x00);
-                buf.extend(mode.to_string().as_bytes());
+                buf.extend(data.mode.to_string().as_bytes());
                 buf.push(0x00);
+                data.opt.add_options(&mut buf);
             },
             Self::Data { block, data } => {
                 buf.extend(0x0003_u16.to_be_bytes());
@@ -305,6 +435,10 @@ impl Packet {
                 buf.extend(code.to_u16().to_be_bytes());
                 buf.extend(message.as_bytes());
                 buf.push(0x00);
+            },
+            Self::OptionsAck(opt) => {
+                buf.extend(0x0006_u16.to_be_bytes());
+                opt.add_options(&mut buf);
             },
         }
         buf
@@ -328,7 +462,7 @@ impl TftpSocket {
     }
 
     pub async fn recv_with_timeout(&mut self, ttl: Duration) -> TftpResult<(Packet, SocketAddr)> {
-        let mut buf = [0; 514];
+        let mut buf = [0; 1 << 16];
         let (total_written, src) = timeout(ttl, self.sock.recv_from(&mut buf)).await??;
 
         let packet = Packet::parse_from_buf(&buf[..total_written])?;
@@ -366,7 +500,22 @@ mod tests {
 
         let packet = Packet::parse_from_buf(&buf);
         assert!(packet.is_ok());
-        assert_eq!(packet.unwrap(), Packet::ReadReq { path: "/path/to/data.txt".to_string(), mode: FileMode::Mail });
+        assert_eq!(packet.unwrap(), Packet::ReadReq(InitData { path: "/path/to/data.txt".to_string(), mode: FileMode::Mail, opt: ReqOptions::none() }));
+    }
+
+    // TODO: add some opts
+    fn test_packet_read_req_with_blksize() {
+        let buf = vec![
+            // opcode
+            0x00, 0x01,
+            // path: /path/to/data.txt with terminating nullchar
+            0x2F, 0x70, 0x61, 0x74, 0x68, 0x2F, 0x74, 0x6F, 0x2F, 0x64, 0x61, 0x74, 0x61, 0x2E, 0x74, 0x78, 0x74, 0x00,
+            // mode: mail
+            0x6D, 0x61, 0x69, 0x6C, 0x00];
+
+        let packet = Packet::parse_from_buf(&buf);
+        assert!(packet.is_ok());
+        assert_eq!(packet.unwrap(), Packet::ReadReq(InitData { path: "/path/to/data.txt".to_string(), mode: FileMode::Mail, opt: ReqOptions::none() }));
     }
 
     #[test]
@@ -381,7 +530,7 @@ mod tests {
 
         let packet = Packet::parse_from_buf(&buf);
         assert!(packet.is_ok());
-        assert_eq!(packet.unwrap(), Packet::WriteReq { path: "/path/to/data.txt".to_string(), mode: FileMode::Mail });
+        assert_eq!(packet.unwrap(), Packet::WriteReq(InitData { path: "/path/to/data.txt".to_string(), mode: FileMode::Mail, opt: ReqOptions::none() }));
     }
 
 
