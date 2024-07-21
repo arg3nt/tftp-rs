@@ -133,6 +133,7 @@
 
 use std::net::Ipv4Addr;
 
+pub mod processor;
 pub mod tftp;
 pub mod srv_conn;
 

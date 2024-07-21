@@ -20,15 +20,15 @@
 // expose the same management API to the connection management system, but the implementations of
 // what happens during the work, wait, and termination phases are distinct.
 
+use crate::processor::{PacketProcessor, ResultAction};
 use crate::tftp;
 use rand::Rng;
-use tokio::time::Instant;
 use std::error;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
-use tokio::fs::File;
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::io;
+use tokio::time::Instant;
 
 /// An object responsible for handling a request.
 pub struct ServerRequestHandler {
@@ -83,20 +83,16 @@ impl ServerRequestHandler {
                     ));
                 }
 
-                let file = File::open(path).await;
-                match file {
+                let processor = match PacketProcessor::new_for_reading(path).await {
+                    Ok(p) => p,
                     Err(e) => {
-                        send_error_packet(&mut sock, src, e.kind().into(), format!("{:#?}", e))
-                            .await;
-                        Err(e.into())
-                    }
-                    Ok(f) => Ok(ServerRequestHandler {
-                        sock,
-                        dst: src,
-                        processor: PacketProcessor::Read(ReadProcessor::new(f)),
-                    }),
-                }
-            }
+                        send_error_packet(&mut sock, src, e.kind().into(), format!("{:#?}", e)).await;
+                        return Err(e.into());
+                    },
+                };
+
+                Ok(ServerRequestHandler { sock, dst: src, processor})
+            },
             tftp::Packet::WriteReq { path, mode } => {
                 if *mode == tftp::FileMode::Mail {
                     send_error_packet(
@@ -111,26 +107,17 @@ impl ServerRequestHandler {
                     ));
                 }
 
-                let file = File::options()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .open(path)
-                    .await;
-                match file {
+                let processor = match PacketProcessor::new_for_writing(path).await {
+                    Ok(p) => p,
                     Err(e) => {
-                        send_error_packet(&mut sock, src, e.kind().into(), format!("{:#?}", e))
-                            .await;
-                        Err(e.into())
-                    }
-                    Ok(f) => Ok(ServerRequestHandler {
-                        sock,
-                        dst: src,
-                        processor: PacketProcessor::Write(WriteProcessor::new(f)),
-                    }),
-                }
-            }
-            &_ => Err(ServerConnectionError::BadRequest(
+                        send_error_packet(&mut sock, src, e.kind().into(), format!("{:#?}", e)).await;
+                        return Err(e.into());
+                    },
+                };
+
+                Ok(ServerRequestHandler { sock, dst: src, processor })
+            },
+            _ => Err(ServerConnectionError::BadRequest(
                 "Only read and write requests are valid initial requests.".to_string(),
             )),
         }
@@ -243,227 +230,11 @@ impl ServerRequestHandler {
     }
 }
 
-enum PacketProcessor {
-    Read(ReadProcessor),
-    Write(WriteProcessor),
-}
-
-/// Represents an action that the caller of PacketProcessor should take in
-/// response to processing a packet.
-enum ResultAction {
-    /// Caller should send the packet and await a response.
-    SendPacketAndAwait(tftp::Packet),
-
-    /// Caller should close the connection without sending a message, optionally logging a string.
-    CloseConnection(Option<String>),
-
-    /// Caller should try receiving the last packet again.
-    RetryRecv,
-
-    /// Caller should terminate the connection by sending the packet.
-    TerminateWithPacket(tftp::Packet),
-}
-
-struct ReadProcessor {
-    f: File,
-    curr_block: u16,
-    awaiting_final_ack: bool,
-}
-
-impl ReadProcessor {
-    fn new(f: File) -> ReadProcessor {
-        ReadProcessor {
-            f,
-            curr_block: 0,
-            awaiting_final_ack: false,
-        }
-    }
-
-    async fn process_ack(&mut self, packet: &tftp::Packet) -> ResultAction {
-        match packet {
-            &tftp::Packet::Ack { block } => {
-                match block {
-                    block if block == self.curr_block => {
-                        if self.awaiting_final_ack {
-                            return ResultAction::CloseConnection(None)
-                        }
-                        match read_block_from_file(&mut self.f).await {
-                            Ok(data) => {
-                                self.curr_block += 1;
-                                if data.len() < tftp::DATA_BUFFER_SIZE {
-                                    self.awaiting_final_ack = true;
-                                }
-                                ResultAction::SendPacketAndAwait(
-                                    tftp::Packet::Data { block: self.curr_block , data }
-                                )
-                            },
-                            Err(e) => ResultAction::TerminateWithPacket(
-                                tftp::Packet::Error { code: e.kind().into(), message: format!("Failed to read from file: {:#?}", e) }
-                            ),
-                        }
-                    },
-                    block if block < self.curr_block => {
-                        // Ignore acks for blocks we know have already been acknowledged.
-                        ResultAction::RetryRecv
-                    },
-                    _ => {
-                        ResultAction::TerminateWithPacket(
-                            tftp::Packet::Error {
-                                code: tftp::ErrorCode::Illegal,
-                                message: format!(
-                                    "Cannot acknowledge a block which was not yet sent. Server's current block is {cb}, but received an ack for {block}",
-                                    cb = self.curr_block
-                                )
-                            }
-                        )
-                    },
-                }
-            }
-            _ => ResultAction::TerminateWithPacket(tftp::Packet::Error {
-                code: tftp::ErrorCode::Illegal,
-                message: format!(
-                    "Expected to receive an Ack message on this connection, but got {:#?} instead",
-                    packet
-                ),
-            }),
-        }
-    }
-}
-
-async fn read_block_from_file(f: &mut File) -> Result<Vec<u8>, io::Error> {
-    let mut buf = vec![0_u8; tftp::DATA_BUFFER_SIZE];
-    let mut cursor = 0;
-
-    // Reading works this way because we have no guarantee that a particular call to read will
-    // actually fill the buffer all the way. To compensate for this, if we don't fully fill the
-    // buffer on the call to read, we pass a progressively smaller slice of the buffer that we
-    // haven't yet populated into the read function until we reach the end of the file or fully
-    // populate the buffer.
-    loop {
-        match f.read(&mut buf[cursor..]).await {
-            Ok(s) => {
-                if cursor + s == buf.len() {
-                    return Ok(buf);
-                } else if s == 0 {
-                    buf.truncate(cursor + s);
-                    return Ok(buf);
-                } else {
-                    cursor += s;
-                    continue;
-                };
-            }
-            Err(e) => return Err(e),
-        };
-    }
-}
-
-struct WriteProcessor {
-    f: File,
-    curr_block: u16,
-}
-
-impl WriteProcessor {
-    fn new(f: File) -> WriteProcessor {
-        WriteProcessor { f, curr_block: 0 }
-    }
-
-    async fn process_data(&mut self, packet: &tftp::Packet) -> ResultAction {
-        match packet {
-            tftp::Packet::Data { block, data } => {
-                match block {
-                    block if *block == 0 && self.curr_block == 0 => {
-                        ResultAction::SendPacketAndAwait(
-                            tftp::Packet::Ack { block: 0 }
-                        )
-                    },
-                    block if *block == self.curr_block + 1 => {
-                        match write_block_to_file(&mut self.f, &data).await {
-                            None => {
-                                self.curr_block += 1;
-                                let packet = tftp::Packet::Ack { block: self.curr_block };
-
-                                if data.len() < tftp::DATA_BUFFER_SIZE {
-                                    ResultAction::TerminateWithPacket(packet)
-                                } else {
-                                    ResultAction::SendPacketAndAwait(packet)
-                                }
-                            },
-                            Some(e) => ResultAction::TerminateWithPacket(
-                                tftp::Packet::Error {
-                                    code: e.kind().into(),
-                                    message: format!("Error writing to file: {:#?}", e)
-                                }
-                            ),
-                        }
-                    },
-                    block if *block < self.curr_block + 1 => {
-                        // Ignore data packets from previous requests that e.g. may have been
-                        // duplicated in transit
-                        ResultAction::RetryRecv
-                    },
-                    _ => ResultAction::TerminateWithPacket(
-                        tftp::Packet::Error {
-                            code: tftp::ErrorCode::Illegal,
-                            message: format!(
-                                "Data blocks must be received by the server in sequence. Server received data for block {block}, \
-                                but the server has only received up to block {cb}.", cb = self.curr_block),
-                        }
-                    ),
-                }
-            }
-            _ => ResultAction::TerminateWithPacket(tftp::Packet::Error {
-                code: tftp::ErrorCode::Illegal,
-                message: format!(
-                    "Expected to receive a Data packet on this connection, but got {:#?} instead",
-                    packet
-                ),
-            }),
-        }
-    }
-}
-
-async fn write_block_to_file(f: &mut File, buf: &[u8]) -> Option<io::Error> {
-    let mut cursor = 0;
-    loop {
-        match f.write(&buf[cursor..]).await {
-            Ok(s) => {
-                if cursor + s == buf.len() {
-                    return None;
-                }
-                cursor += s;
-                continue;
-            }
-            Err(e) => return Some(e),
-        }
-    }
-}
-
-/// An entity that can process packets and produce a response.
-impl PacketProcessor {
-    async fn first_packet(&mut self) -> ResultAction {
-        let first_packet = match self {
-            PacketProcessor::Read(_) => tftp::Packet::Ack { block: 0 },
-            PacketProcessor::Write(_) => tftp::Packet::Data {
-                block: 0,
-                data: vec![],
-            },
-        };
-        self.process_packet(&first_packet).await
-    }
-
-    /// Given an incoming packet, processes it and describes the action the caller should take.
-    async fn process_packet(&mut self, packet: &tftp::Packet) -> ResultAction {
-        match self {
-            PacketProcessor::Read(p) => p.process_ack(packet).await,
-            PacketProcessor::Write(p) => p.process_data(packet).await,
-        }
-    }
-}
 
 #[derive(Debug)]
 pub enum ServerConnectionError {
     BadRequest(String),
-    File(std::io::Error),
+    File(io::Error),
     Internal(String),
 }
 
