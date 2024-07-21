@@ -139,24 +139,46 @@ pub mod srv_conn;
 use tftp::TftpSocket;
 use srv_conn::ServerRequestHandler;
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
-
-use anyhow::Result;
+use std::path::Path;
+use std::time::Duration;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     println!("Hello world!");
 
-    let socket = TftpSocket::bind((Ipv4Addr::UNSPECIFIED, 69).into());
+    env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
 
-    let packet= tftp::Packet::ReadReq {
-        path: "/hello/world.txt".to_string(),
-        mode: tftp::FileMode::NetAscii,
+    let mut socket = match TftpSocket::bind((Ipv4Addr::UNSPECIFIED, 69).into()) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Error binding TFTP socket: {:#?}", e);
+            return;
+        },
     };
 
-    let path_prefix = PathBuf::from("/tmp/tftp");
-    let handler = ServerRequestHandler::new(&path_prefix, &packet, (Ipv4Addr::new(127, 0, 0, 1), 12345).into());
-
-    Ok(())
+    loop {
+        match socket.recv_with_timeout(Duration::MAX).await {
+            Ok((packet, peer)) => {
+                log::info!("Got packet: {:#?} from peer {:#?}", packet, peer);
+                tokio::spawn(async move {
+                    log::info!("Thread spawned");
+                    match ServerRequestHandler::new(&Path::new("/tmp/tftp/"), &packet, peer).await {
+                        Ok(mut handler) => {
+                            log::info!("Handling connection");
+                            handler.handle(Duration::from_secs(10)).await;
+                        },
+                        Err(e) => {
+                            log::warn!("Handler initialization error: {:#?}", e);
+                            return;
+                        },
+                    };
+                });
+            },
+            Err(e) => {
+                log::warn!("Got error from socket: {:#?}. Continuing.", e);
+                continue;
+            }
+        };
+    }
 }
 

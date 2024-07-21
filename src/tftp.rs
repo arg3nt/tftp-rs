@@ -2,7 +2,7 @@ use async_io::Async;
 use std::error;
 use std::fmt;
 use std::io;
-use std::net::{Ipv4Addr, UdpSocket, SocketAddr};
+use std::net::{UdpSocket, SocketAddr};
 use std::time::Duration;
 use tokio::time::timeout;
 use tokio::time::error::Elapsed;
@@ -198,7 +198,7 @@ fn retrieve_op_code(buf: &[u8]) -> TftpResult<OpCode> {
 
 
 fn parse_path_and_mode(buf: &[u8]) -> TftpResult<(String, FileMode)> {
-    let (mut path, path_end) = string_from_buffer(&buf);
+    let (path, path_end) = string_from_buffer(&buf);
 
     if path_end == buf.len() {
         return Err(SocketError::PacketParse("Read request does not contain a mode, but it needs to!".to_string()));
@@ -302,12 +302,14 @@ impl Packet {
 ///////////////////////////////////////////////////////////////
 /// Wrapper around a UDP socket that parses TFTP headers and
 /// returns the packets in a more structured format.
+#[derive(Debug)]
 pub struct TftpSocket {
     sock: Async<UdpSocket>,
 }
 
 impl TftpSocket {
     pub fn bind(addr: SocketAddr) -> TftpResult<TftpSocket> {
+        log::info!("Binding to {:#?}", addr);
         Ok(TftpSocket {
             sock: Async::<UdpSocket>::bind(addr)?,
         })
@@ -425,7 +427,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_udp() {
-        let ip_addr = Ipv4Addr::new(127,0,0,1);
+        let ip_addr = std::net::Ipv4Addr::new(127,0,0,1);
         let addr: SocketAddr = (ip_addr, 12345).into();
 
         let sock = Async::<UdpSocket>::bind(addr).unwrap();

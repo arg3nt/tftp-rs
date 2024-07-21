@@ -25,7 +25,7 @@ use crate::tftp;
 use rand::Rng;
 use std::error;
 use std::fmt;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 use tokio::io;
@@ -44,11 +44,12 @@ pub struct ServerRequestHandler {
 }
 
 /// Attempts to bind to a random UDP socket until one succeeds.
-fn bind_random_socket(peer_ip: IpAddr) -> tftp::TftpSocket {
+fn bind_random_socket() -> tftp::TftpSocket {
     let mut rng = rand::thread_rng();
-    let mut sock = tftp::TftpSocket::bind((peer_ip, rng.gen_range(1024..65535)).into());
+    let mut sock = tftp::TftpSocket::bind((Ipv4Addr::UNSPECIFIED, rng.gen_range(1024..65535)).into());
     while !sock.is_ok() {
-        sock = tftp::TftpSocket::bind((peer_ip, rand::thread_rng().gen_range(1024..65535)).into());
+        log::warn!("Couldn't bind socket: {:#?}", sock);
+        sock = tftp::TftpSocket::bind((Ipv4Addr::UNSPECIFIED, rand::thread_rng().gen_range(1024..65535)).into());
     }
     sock.unwrap()
 }
@@ -69,7 +70,8 @@ impl ServerRequestHandler {
         initial_request: &tftp::Packet,
         src: SocketAddr,
     ) -> Result<ServerRequestHandler, ServerConnectionError> {
-        let mut sock = bind_random_socket(src.ip());
+        log::info!("Binding socket");
+        let mut sock = bind_random_socket();
         match initial_request {
             tftp::Packet::ReadReq { path, mode } => {
                 if *mode == tftp::FileMode::Mail {
@@ -143,6 +145,7 @@ impl ServerRequestHandler {
             }
             ResultAction::SendPacketAndAwait(p) => p,
             ResultAction::TerminateWithPacket(p) => {
+                log::warn!("Terminating request to {:#?} and sending packet {:#?}", p, self.dst);
                 let _ = self.sock.send(&p, self.dst);
                 return;
             }
@@ -164,6 +167,7 @@ impl ServerRequestHandler {
                     .await
                 {
                     Ok((packet, src)) => {
+                        log::info!("Got packet from {:#?}: {:#?}", src, packet);
                         // First, check whether the data came from the src we were expecting.
                         if src != self.dst {
                             // Terminate the connection the peer may be trying to start on this
@@ -186,8 +190,9 @@ impl ServerRequestHandler {
                             }
                             ResultAction::CloseConnection(maybe_warn) => {
                                 if let Some(msg) = maybe_warn {
-                                    log::warn!("Terminating connection, but note: {}", msg);
+                                    log::warn!("{}", msg);
                                 }
+                                log::info!("Closing connection with {:#?}", src);
                                 // No more packets to send, our work here is done!
                                 return;
                             }
@@ -196,12 +201,14 @@ impl ServerRequestHandler {
                             }
                             ResultAction::TerminateWithPacket(p) => {
                                 let _ = self.sock.send(&p, src).await;
+                                log::info!("Closing connection with {:#?}", src);
                                 return;
                             }
                         }
                     }
                     // If we timed out, rebroadcast the last sent packet
                     Err(tftp::SocketError::Timeout(_)) => {
+                        log::info!("Timed out, trying again");
                         break;
                     }
                     // If we couldn't parse the incoming packet, send and error and kill the
