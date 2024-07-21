@@ -134,8 +134,10 @@
 use std::net::Ipv4Addr;
 
 pub mod tftp;
+pub mod srv_conn;
 
 use tftp::TftpSocket;
+use srv_conn::ServerRequestHandler;
 
 use anyhow::Result;
 
@@ -145,7 +147,12 @@ async fn main() -> Result<()> {
 
     let socket = TftpSocket::bind((Ipv4Addr::UNSPECIFIED, 69).into());
 
+    let packet= tftp::Packet::ReadReq {
+        path: "/hello/world.txt".to_string(),
+        mode: tftp::FileMode::NetAscii,
+    };
 
+    let handler = ServerRequestHandler::new(&packet, (Ipv4Addr::new(127, 0, 0, 1), 12345).into());
 
     Ok(())
 }

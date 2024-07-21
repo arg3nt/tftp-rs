@@ -7,6 +7,8 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tokio::time::error::Elapsed;
 
+pub const DATA_BUFFER_SIZE: usize = 512;
+
 ///////////////////////////////////////////////////////////////
 // Error-handling objects
 
@@ -46,12 +48,74 @@ impl From<Elapsed> for SocketError {
 type TftpResult<T> = Result<T, SocketError>;
 
 /// Represents the mode for a file the client wishes to read or write.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FileMode { NetAscii, Octet, Mail }
+
+impl FileMode {
+    pub fn from_str(s: &String) -> TftpResult<FileMode> {
+        match s.as_str() {
+            "netascii" => Ok(FileMode::NetAscii),
+            "octet" => Ok(FileMode::Octet),
+            "mail" => Ok(FileMode::Mail),
+            _ => Err(SocketError::PacketParse(format!("Invalid file mode: '{s}'")))
+        }
+    }
+
+    pub fn to_string(&self) -> String {
+        match self {
+            Self::NetAscii => "netascii",
+            Self::Octet => "octet",
+            Self::Mail => "mail",
+        }.to_string()
+    }
+}
 
 /// Represents a TFTP Error code surfaced by a TFTP Error packet
 #[derive(Debug, PartialEq)]
 pub enum ErrorCode { Undefined, FileNotFound, AccessViolation, DiskFull, Illegal, UnknownTid, FileAlreadyExists, NoSuchUser }
+
+impl ErrorCode {
+    pub fn to_u16(&self) -> u16 {
+        match self {
+            Self::Undefined => 0,
+            Self::FileNotFound => 1,
+            Self::AccessViolation => 2,
+            Self::DiskFull => 3,
+            Self::Illegal => 4,
+            Self::UnknownTid => 5,
+            Self::FileAlreadyExists => 6,
+            Self::NoSuchUser => 7,
+        }
+    }
+}
+
+impl From<u16> for ErrorCode {
+    fn from(i: u16) -> ErrorCode {
+        match i {
+            0 => ErrorCode::Undefined,
+            1 => ErrorCode::FileNotFound,
+            2 => ErrorCode::AccessViolation,
+            3 => ErrorCode::DiskFull,
+            4 => ErrorCode::Illegal,
+            5 => ErrorCode::UnknownTid,
+            6 => ErrorCode::FileAlreadyExists,
+            7 => ErrorCode::NoSuchUser,
+            _ => ErrorCode::Undefined,
+        }
+    }
+}
+
+impl From<io::ErrorKind> for ErrorCode {
+    fn from(c: io::ErrorKind) -> ErrorCode {
+        match c {
+            io::ErrorKind::NotFound => ErrorCode::FileNotFound,
+            io::ErrorKind::PermissionDenied => ErrorCode::AccessViolation,
+            io::ErrorKind::AlreadyExists => ErrorCode::FileAlreadyExists,
+            io::ErrorKind::OutOfMemory => ErrorCode::DiskFull,
+            _ => ErrorCode::Undefined,
+        }
+    }
+}
 
 /// An enum representing a TFTP packet and its associated data.
 #[derive(Debug, PartialEq)]
@@ -178,20 +242,9 @@ fn parse_ack(buf: &[u8]) -> TftpResult<Packet> {
 
 fn parse_error(buf: &[u8]) -> TftpResult<Packet> {
     let raw_err = u16_from_buffer(&buf[2..4]);
-    let code = match raw_err {
-        0 => ErrorCode::Undefined,
-        1 => ErrorCode::FileNotFound,
-        2 => ErrorCode::AccessViolation,
-        3 => ErrorCode::DiskFull,
-        4 => ErrorCode::Illegal,
-        5 => ErrorCode::UnknownTid,
-        6 => ErrorCode::FileAlreadyExists,
-        7 => ErrorCode::NoSuchUser,
-        _ => ErrorCode::Undefined,
-    };
 
     let (message, _) = string_from_buffer(&buf[4..]);
-    Ok(Packet::Error { code, message })
+    Ok(Packet::Error { code: raw_err.into(), message })
 }
 
 impl Packet {
@@ -207,6 +260,42 @@ impl Packet {
             OpCode::Ack => parse_ack(&buf),
             OpCode::Error => parse_error(&buf),
         }
+    }
+
+    fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        match self {
+            Self::ReadReq { path, mode } => {
+                buf.extend(0x0001_u16.to_be_bytes());
+                buf.extend(path.as_bytes());
+                buf.push(0x00);
+                buf.extend(mode.to_string().as_bytes());
+                buf.push(0x00);
+            },
+            Self::WriteReq { path, mode } => {
+                buf.extend(0x0002_u16.to_be_bytes());
+                buf.extend(path.as_bytes());
+                buf.push(0x00);
+                buf.extend(mode.to_string().as_bytes());
+                buf.push(0x00);
+            },
+            Self::Data { block, data } => {
+                buf.extend(0x0003_u16.to_be_bytes());
+                buf.extend(block.to_be_bytes());
+                buf.extend(data);
+            },
+            Self::Ack { block } => {
+                buf.extend(0x0004_u16.to_be_bytes());
+                buf.extend(block.to_be_bytes());
+            },
+            Self::Error { code, message } => {
+                buf.extend(0x0005_u16.to_be_bytes());
+                buf.extend(code.to_u16().to_be_bytes());
+                buf.extend(message.as_bytes());
+                buf.push(0x00);
+            },
+        }
+        buf
     }
 }
 
@@ -230,6 +319,14 @@ impl TftpSocket {
 
         let packet = Packet::parse_from_buf(&buf[..total_written])?;
         Ok((packet, src))
+    }
+
+    pub async fn send(&mut self, packet: &Packet, dst: SocketAddr) -> TftpResult<usize> {
+        let buf = packet.serialize();
+        match self.sock.send_to(&buf, dst).await {
+            Ok(i) => Ok(i),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
