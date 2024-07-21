@@ -19,12 +19,8 @@ impl PacketProcessor {
     }
 
     pub async fn new_for_writing(path: &Path) -> Result<PacketProcessor, io::Error> {
-        match File::options()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .await
+        log::info!("Writing to {:#?}", path);
+        match File::create_new(path).await
         {
             Ok(f) => Ok(PacketProcessor::Write(WriteProcessor::new(f))),
             Err(e) => Err(e),

@@ -157,6 +157,18 @@ pub enum Packet {
     },
 }
 
+impl fmt::Display for Packet {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::ReadReq { path, mode } => write!(f, "ReadReq < path: '{}', mode: '{:#?}' >", path, mode),
+            Self::WriteReq { path, mode } => write!(f, "WriteReq < path: '{}', mode: '{:#?}' >", path, mode),
+            Self::Data { block, data } => write!(f, "Data < block: {block}, data_len: {len} >", len = data.len()),
+            Self::Ack { block } => write!(f, "Ack < block: {block} >"),
+            Self::Error { code, message } => write!(f, "Error < code: {:#?}, message: {message} >", code),
+        }
+    }
+}
+
 fn u16_from_buffer(buf: &[u8]) -> u16 {
     (u16::from(buf[0]) << 8) + u16::from(buf[1])
 }

@@ -167,7 +167,7 @@ impl ServerRequestHandler {
                     .await
                 {
                     Ok((packet, src)) => {
-                        log::info!("Got packet from {:#?}: {:#?}", src, packet);
+                        log::info!("Got packet from {:#?}: {}", src, packet);
                         // First, check whether the data came from the src we were expecting.
                         if src != self.dst {
                             // Terminate the connection the peer may be trying to start on this
