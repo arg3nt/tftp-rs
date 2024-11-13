@@ -1,4 +1,6 @@
 // This is an implementation of a TFTP server compliant with RFC 1350
+//
+// As of today, it only supports the octet file format. netascii support is a WIP.
 
 
 // Transfer begins with request to read or write a file (also req for connection)
